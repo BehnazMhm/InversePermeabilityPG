@@ -39,6 +39,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import joblib
 
+import torch.nn.functional as F  # add this near the top if not already there
+
+
 # ---------------------------
 # Utilities / Config
 # ---------------------------
@@ -258,6 +261,42 @@ class DiffusionMLP(nn.Module):
         # Predict clean parameters
         return self.out(h)
 
+
+
+
+class ForwardMLP(nn.Module):
+    """
+    Simple MLP: maps standardized parameters x0 -> standardized cond (log10 Kxx,Kyy,Kzz).
+    """
+    def __init__(
+        self,
+        param_dim: int,
+        cond_dim: int = 3,
+        hidden=(256, 256),
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        layer_norm: bool = True,
+    ):
+        super().__init__()
+        acts = {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU, "tanh": nn.Tanh}
+        Act = acts.get(activation, nn.GELU)
+
+        layers = []
+        prev = param_dim
+        for h in hidden:
+            layers.append(nn.Linear(prev, h))
+            if layer_norm:
+                layers.append(nn.LayerNorm(h))
+            layers.append(Act())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev = h
+        layers.append(nn.Linear(prev, cond_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
 class InverseDiffusionLightning(pl.LightningModule):
     """
     LightningModule that trains a conditional diffusion model
@@ -265,19 +304,22 @@ class InverseDiffusionLightning(pl.LightningModule):
     
     Uses a variance-preserving diffusion process with linear noise schedule.
     """
+
     def __init__(
         self,
         param_dim: int,
         cond_dim: int,
         lr: float = 1e-3,
-        weight_decay: float = 1e-4,
+        weight_decay: float = 1e-5,
         sigma_min: float = 0.01,
         sigma_max: float = 0.8,
         use_cosine_schedule: bool = True,
+        forward_model: nn.Module | None = None,   # <--- new
+        lambda_forward: float = 0.0,             # <--- new
         **mlp_kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["forward_model"])  # don't try to pickle the whole model
         self.param_dim = param_dim
         self.cond_dim = cond_dim
         self.model = DiffusionMLP(
@@ -289,6 +331,15 @@ class InverseDiffusionLightning(pl.LightningModule):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.use_cosine_schedule = use_cosine_schedule
+
+        # Forward model (frozen)
+        self.forward_model = forward_model
+        self.lambda_forward = lambda_forward
+        if self.forward_model is not None:
+            self.forward_model.eval()
+            for p in self.forward_model.parameters():
+                p.requires_grad = False
+
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(
@@ -324,16 +375,26 @@ class InverseDiffusionLightning(pl.LightningModule):
         x_t = x0 + sigma * eps                              # forward diffusion: x_t = x0 + sigma * eps
         
         x0_hat = self.model(x_t, cond, t)                   # predict clean params
-        
-        base_loss = (x0_hat - x0).pow(2).mean(dim=1)        # [B]
-        w = (sigma.view(-1) / self.sigma_max) ** 2 + 1e-3   # Example weight: focus more on larger sigma
-        loss = (w * base_loss).mean()
 
-        # loss = self.crit(x0_hat, x0)                        # MSE loss on x0 prediction
-        
+        # --- Diffusion loss (noise-level-weighted MSE) ---
+        base_loss = (x0_hat - x0).pow(2).mean(dim=1)        # [B]
+        w = (sigma.view(-1) / self.sigma_max) ** 2 + 1e-3   # focus more on larger sigma
+        diff_loss = (w * base_loss).mean()
+
+        # --- Forward consistency loss (using frozen forward model) ---
+        fwd_loss = torch.tensor(0.0, device=device)
+        if self.forward_model is not None and self.lambda_forward > 0.0:
+            # with torch.no_grad():
+            pred_cond = self.forward_model(x0_hat)      # [B, cond_dim] in standardized cond space
+            fwd_loss = F.mse_loss(pred_cond, cond)
+            # You can log it for monitoring:
+            self.log(f"{stage}/forward_loss", fwd_loss, prog_bar=False, on_epoch=True, on_step=False)
+
+        loss = diff_loss + self.lambda_forward * fwd_loss
+
         self.log(f"{stage}/loss", loss, prog_bar=True, on_epoch=True, on_step=False)
         
-        # Additional metrics for monitoring
+        # Additional metrics for monitoring (on x0)
         with torch.no_grad():
             mae = (x0_hat - x0).abs().mean()
             self.log(f"{stage}/mae", mae, prog_bar=False, on_epoch=True, on_step=False)
@@ -348,20 +409,28 @@ class InverseDiffusionLightning(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x0, cond = batch
-        # Compute both single-step and generation metrics
+        # Single-step + diffusion/forward loss
         loss = self._step_common(batch, "test")
         
-        # Generate samples and compute reconstruction metrics
-        # Use 200 steps (best quality) for final evaluation
+        # Generate samples and compute reconstruction + forward metrics
         with torch.no_grad():
             x0_gen = self.sample(cond, num_steps=500)
-            
-            # Metrics in standardized space
+
+            # Metrics in standardized parameter space
             mse = (x0_gen - x0).pow(2).mean()
             mae = (x0_gen - x0).abs().mean()
-            
             self.log("test/mse_gen", mse, prog_bar=True, on_epoch=True)
             self.log("test/mae_gen", mae, prog_bar=True, on_epoch=True)
+
+            # Forward consistency for generated parameters (if forward model exists)
+            if self.forward_model is not None:
+                pred_cond_gen = self.forward_model(x0_gen)   # standardized cond
+                fwd_gen_mse = F.mse_loss(pred_cond_gen, cond)
+                fwd_gen_mae = (pred_cond_gen - cond).abs().mean()
+                self.log("test/fwd_mse_gen", fwd_gen_mse, prog_bar=True, on_epoch=True)
+                self.log("test/fwd_mae_gen", fwd_gen_mae, prog_bar=True, on_epoch=True)
+
+
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, num_steps: int = 500) -> torch.Tensor:
@@ -446,25 +515,119 @@ class InverseDiffusionLightning(pl.LightningModule):
 # ---------------------------
 # Training / Testing wrappers
 # ---------------------------
+class ForwardLightning(pl.LightningModule):
+    def __init__(self, model: nn.Module, lr: float = 1e-3, weight_decay: float = 1e-5):
+        super().__init__()
+        self.model = model
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.crit = nn.MSELoss()
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="min", patience=8, factor=0.5
+        )
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "monitor": "val/loss"}}
+
+    def forward(self, x):
+        return self.model(x)
+
+    def _step_common(self, batch, stage: str):
+        x0, cond = batch  # both already standardized
+        pred = self.model(x0)
+        loss = self.crit(pred, cond)
+        self.log(f"{stage}/loss", loss, prog_bar=True, on_epoch=True, on_step=False)
+        with torch.no_grad():
+            mae = (pred - cond).abs().mean()
+            self.log(f"{stage}/mae", mae, prog_bar=False, on_epoch=True, on_step=False)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._step_common(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        self._step_common(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        self._step_common(batch, "test")
+
+
+
+def train_forward_model(
+    train_loader,
+    val_loader,
+    param_dim: int,
+    cond_dim: int,
+    outdir: str,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-5,
+    max_epochs: int = 300,
+    patience: int = 20,
+):
+    print("== Training forward model (parameters -> permeability) ==")
+    fwd_outdir = os.path.join(outdir, "forward_model")
+    os.makedirs(fwd_outdir, exist_ok=True)
+
+    fwd_mlp = ForwardMLP(param_dim=param_dim, cond_dim=cond_dim, hidden=(256, 256))
+    fwd_lit = ForwardLightning(fwd_mlp, lr=lr, weight_decay=weight_decay)
+
+    ckpt_cb = ModelCheckpoint(
+        dirpath=fwd_outdir,
+        filename="forward-{epoch:03d}-{val_loss:.6f}",
+        monitor="val/loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+    )
+    es_cb = EarlyStopping(monitor="val/loss", mode="min", patience=patience)
+
+    trainer = pl.Trainer(
+        max_epochs=max_epochs,
+        accelerator="auto",
+        devices="auto",
+        callbacks=[ckpt_cb, es_cb],
+        log_every_n_steps=10,
+        default_root_dir=fwd_outdir,
+    )
+    trainer.fit(fwd_lit, train_loader, val_loader)
+    print("Best forward checkpoint:", ckpt_cb.best_model_path)
+
+    # Load the best checkpoint and return the underlying nn.Module
+    best_fwd = ForwardLightning.load_from_checkpoint(ckpt_cb.best_model_path, model=fwd_mlp)
+    forward_model = best_fwd.model
+    forward_model.eval()
+    for p in forward_model.parameters():
+        p.requires_grad = False  # freeze
+    return forward_model
+
 
 def build_inverse_model_and_callbacks(param_dim: int,
                                       cond_dim: int,
                                       outdir: str,
                                       learning_rate: float,
-                                      patience: int):
+                                      patience: int,
+                                      forward_model: nn.Module,
+                                      lambda_forward: float = 0.1):
     model = InverseDiffusionLightning(
         param_dim=param_dim,
         cond_dim=cond_dim,
         lr=learning_rate,
-        weight_decay=1e-4,
+        weight_decay=1e-5,
         hidden=(512, 512, 256),
         activation="gelu",
         dropout=0.0,
-        # dropout=0.1,
         layer_norm=True,
         time_dim=32,
         sigma_min=0.01,
         sigma_max=1.0,
+        use_cosine_schedule=True,
+        forward_model=forward_model,         # <--- pass it in
+        lambda_forward=lambda_forward,       # <--- weight for forward-consistency
     )
     ckpt_cb = ModelCheckpoint(
         dirpath=outdir,
@@ -493,12 +656,15 @@ def train_and_validate(trainer, model, train_loader, val_loader, ckpt_cb):
     print("Best checkpoint:", ckpt_cb.best_model_path)
     return ckpt_cb.best_model_path
 
-def test_current_and_best(trainer, model, test_loader, best_ckpt_path):
+def test_current_and_best(trainer, model, test_loader, best_ckpt_path, forward_model):
     print("\n== Test (current model) ==")
     trainer.test(model, dataloaders=test_loader)
     
-    # print("\n== Test (best checkpoint) ==")
-    best_model = InverseDiffusionLightning.load_from_checkpoint(best_ckpt_path)
+    print("\n== Test (best checkpoint) ==")
+    best_model = InverseDiffusionLightning.load_from_checkpoint(
+        best_ckpt_path,
+        forward_model=forward_model,
+    )
     trainer.test(best_model, dataloaders=test_loader)
 
 # ---------------------------
@@ -520,9 +686,9 @@ def main():
     max_epochs = 500
     outdir = "./runs/perm_inverse_diffusion"
     os.makedirs(outdir, exist_ok=True)
-    learning_rate = 1e-3
+    # learning_rate = 1e-3
     learning_rate = 3e-4
-    patience = 20
+    patience = 40
 
     # Data
     df, param_cols, perm_cols = load_dataframe_inverse(csv_path)
@@ -533,12 +699,27 @@ def main():
      scaler_x0, scaler_cond) = arrays_and_scalers_inverse(df_train, df_val, df_test,
                                                           param_cols, perm_cols)
 
+    print("scaler_cond.mean_ (log10 K):", scaler_cond.mean_)
+    print("scaler_cond.scale_ (std-dev of log10 K):", scaler_cond.scale_)
+
     train_loader, val_loader, test_loader = make_inverse_loaders(
         x0_tr, cond_tr,
         x0_va, cond_va,
         x0_te, cond_te,
         batch_size=batch_size,
         num_workers=num_workers,
+    )
+    # 1) Train forward model (parameters -> permeability)
+    forward_model = train_forward_model(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        param_dim=len(param_cols),
+        cond_dim=len(perm_cols),
+        outdir=outdir,
+        lr=1e-3,
+        weight_decay=1e-5,
+        max_epochs=300,
+        patience=20,
     )
 
     # Model + callbacks + trainer
@@ -548,12 +729,16 @@ def main():
         outdir=outdir,
         learning_rate=learning_rate,
         patience=patience,
+        forward_model=forward_model,         # <-- from above
+        lambda_forward=0.1,                  # you can tune this (0.01–0.5)
     )
+    
     trainer = build_trainer(max_epochs=max_epochs, outdir=outdir, callbacks=[ckpt_cb, es_cb])
 
     # Train / Validate / Test
     best_ckpt = train_and_validate(trainer, model, train_loader, val_loader, ckpt_cb)
-    test_current_and_best(trainer, model, test_loader, best_ckpt)
+    test_current_and_best(trainer, model, test_loader, best_ckpt, forward_model)
+
 
     # Save scalers for later sampling / inverse-transform
     # joblib.dump(scaler_x0, os.path.join(outdir, "scaler_x0.joblib"))
@@ -562,4 +747,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
