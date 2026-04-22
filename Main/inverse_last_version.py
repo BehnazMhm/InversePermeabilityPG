@@ -846,7 +846,8 @@ def main(
         set_seed(initial_seed)
 
     # --- Config ---
-    csv_path = "./result_no_duplicates_behnaz_remove_10.csv"
+    # csv_path = "./result_no_duplicates_behnaz_remove_10.csv"
+    csv_path = "./2500x2500x250_data.csv"
     val_size, test_size, seed = 0.15, 0.15, 42
     batch_size, num_workers = 64, 15
     max_epochs = 500
